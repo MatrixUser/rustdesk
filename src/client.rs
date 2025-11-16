@@ -204,7 +204,7 @@ impl Client {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
         interface.update_received(false);
-        match Self::_start(peer, key, token, conn_type, interface).await {
+        match Self::_start(peer, key, token, conn_type, interface.clone()).await {
             Err(err) => {
                 let err_str = err.to_string();
                 if err_str.starts_with("Failed") {
@@ -213,7 +213,19 @@ impl Client {
                     return Err(err);
                 }
             }
-            Ok(x) => Ok(x),
+            Ok(x) => {
+                // Set x.2 to true only in the connect() function to indicate that direct_failures needs to be updated; everywhere else it should be set to false.
+                if x.2 {
+                    let direct_failures = interface.get_lch().read().unwrap().direct_failures;
+                    let direct = x.0 .1;
+                    if !interface.is_force_relay() && (direct_failures == 0) != direct {
+                        let n = if direct { 0 } else { 1 };
+                        log::info!("direct_failures updated to {}", n);
+                        interface.get_lch().write().unwrap().set_direct_failure(n);
+                    }
+                }
+                Ok((x.0, x.1))
+            }
         }
     }
 
@@ -233,6 +245,7 @@ impl Client {
             &'static str,
         ),
         (i32, String),
+        bool,
     )> {
         if config::is_incoming_only() {
             bail!("Incoming only mode");
@@ -249,6 +262,7 @@ impl Client {
                     "TCP",
                 ),
                 (0, "".to_owned()),
+                false,
             ));
         }
         // Allow connect to {domain}:{port}
@@ -262,6 +276,7 @@ impl Client {
                     "TCP",
                 ),
                 (0, "".to_owned()),
+                false,
             ));
         }
 
@@ -343,7 +358,7 @@ impl Client {
         );
         connect_futures.push(fut.boxed());
         match select_ok(connect_futures).await {
-            Ok(conn) => Ok((conn.0 .0, conn.0 .1)),
+            Ok(conn) => Ok((conn.0 .0, conn.0 .1, conn.0 .2)),
             Err(e) => Err(e),
         }
     }
@@ -368,6 +383,7 @@ impl Client {
             &'static str,
         ),
         (i32, String),
+        bool,
     )> {
         let mut start = Instant::now();
         let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
@@ -541,7 +557,7 @@ impl Client {
                         connect_futures.push(
                             async move {
                                 let conn = fut.await?;
-                                Ok((conn, None, "Relay"))
+                                Ok((conn, None, if use_ws() { "WebSocket" } else { "Relay" }))
                             }
                             .boxed(),
                         );
@@ -556,7 +572,11 @@ impl Client {
                         log::info!("{:?} used to establish {typ} connection", start.elapsed());
                         let pk =
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
-                        return Ok(((conn, false, pk, kcp, typ), (feedback, rendezvous_server)));
+                        return Ok((
+                            (conn, typ == "IPv6", pk, kcp, typ),
+                            (feedback, rendezvous_server),
+                            false,
+                        ));
                     }
                     _ => {
                         log::error!("Unexpected protobuf msg received: {:?}", msg_in);
@@ -602,6 +622,7 @@ impl Client {
             )
             .await?,
             (feedback, rendezvous_server),
+            true,
         ))
     }
 
@@ -688,7 +709,6 @@ impl Client {
         };
 
         let mut direct = !conn.is_err();
-        interface.update_direct(Some(direct));
         if interface.is_force_relay() || conn.is_err() {
             if !relay_server.is_empty() {
                 conn = Self::request_relay(
@@ -701,8 +721,9 @@ impl Client {
                     conn_type,
                 )
                 .await;
-                interface.update_direct(Some(false));
                 if let Err(e) = conn {
+                    // this direct is mainly used by on_establish_connection_error, so we update it here before bail
+                    interface.update_direct(Some(false));
                     bail!("Failed to connect via relay server: {}", e);
                 }
                 typ = "Relay";
@@ -711,19 +732,22 @@ impl Client {
                 bail!("Failed to make direct connection to remote desktop");
             }
         }
-        if !relay_server.is_empty() && (direct_failures == 0) != direct {
-            let n = if direct { 0 } else { 1 };
-            log::info!("direct_failures updated to {}", n);
-            interface.get_lch().write().unwrap().set_direct_failure(n);
-        }
         let mut conn = conn?;
         log::info!(
             "{:?} used to establish {typ} connection with {} punch",
             start.elapsed(),
             punch_type
         );
-        let pk = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await?;
-        log::info!("{} punch secure_connection ok", punch_type);
+        let res = Self::secure_connection(peer_id, signed_id_pk, key, &mut conn).await;
+        let pk: Option<Vec<u8>> = match res {
+            Ok(pk) => pk,
+            Err(e) => {
+                // this direct is mainly used by on_establish_connection_error, so we update it here before bail
+                interface.update_direct(Some(direct));
+                bail!(e);
+            }
+        };
+        log::debug!("{} punch secure_connection ok", punch_type);
         Ok((conn, direct, pk, kcp, typ))
     }
 
@@ -1305,7 +1329,7 @@ impl AudioHandler {
 
         self.simple = Some(Simple::new(
             None,                   // Use the default server
-            &crate::get_app_name(), // Our applicationâ€™s name
+            &crate::get_app_name(), // Our application’s name
             Direction::Playback,    // We want a playback stream
             None,                   // Use the default device
             "playback",             // Description of our stream
@@ -1758,41 +1782,13 @@ impl LoginConfigHandler {
         shared_password: Option<String>,
         conn_token: Option<String>,
     ) {
-        let mut id = id;
-        if id.contains("@") {
-            let mut v = id.split("@");
-            let raw_id: &str = v.next().unwrap_or_default();
-            let mut server_key = v.next().unwrap_or_default().split('?');
-            let server = server_key.next().unwrap_or_default();
-            let args = server_key.next().unwrap_or_default();
-            let key = if server == PUBLIC_SERVER {
-                config::RS_PUB_KEY.to_owned()
-            } else {
-                let mut args_map: HashMap<String, &str> = HashMap::new();
-                for arg in args.split('&') {
-                    if let Some(kv) = arg.find('=') {
-                        let k = arg[0..kv].to_lowercase();
-                        let v = &arg[kv + 1..];
-                        args_map.insert(k, v);
-                    }
-                }
-                let key = args_map.remove("key").unwrap_or_default();
-                key.to_owned()
-            };
-
-            // here we can check <id>/r@server
-            let real_id = crate::ui_interface::handle_relay_id(raw_id).to_string();
-            if real_id != raw_id {
-                force_relay = true;
-            }
-            self.other_server = Some((real_id.clone(), server.to_owned(), key));
-            id = format!("{real_id}@{server}");
-        } else {
-            let real_id = crate::ui_interface::handle_relay_id(&id);
-            if real_id != id {
-                force_relay = true;
-                id = real_id.to_owned();
-            }
+	let format_id = format_id(id.as_str());
+        let id = format_id.id;
+        if format_id.force_relay {
+            force_relay = true;
+        };
+        if format_id.server.is_some() {
+            self.other_server = format_id.server;
         }
 
         self.id = id;
@@ -2003,7 +1999,7 @@ impl LoginConfigHandler {
     ///
     // It's Ok to check the option empty in this function.
     // `toggle_option()` is only called in a session.
-    // Custom client advanced settings will not affact this function.
+    // Custom client advanced settings will not effect this function.
     pub fn toggle_option(&mut self, name: String) -> Option<Message> {
         let mut option = OptionMessage::default();
         let mut config = self.load_config();
@@ -2108,7 +2104,19 @@ impl LoginConfigHandler {
                 option.show_remote_cursor = f(self.get_toggle_option("show-remote-cursor"));
                 option.enable_file_transfer = f(self.config.enable_file_copy_paste.v);
                 option.lock_after_session_end = f(self.config.lock_after_session_end.v);
+                if config.show_my_cursor.v {
+                    config.show_my_cursor.v = false;
+                    option.show_my_cursor = BoolOption::No.into();
+                }
             }
+        } else if name == "show-my-cursor" {
+            config.show_my_cursor.v = !config.show_my_cursor.v;
+            option.show_my_cursor = if config.show_my_cursor.v {
+                BoolOption::Yes
+            } else {
+                BoolOption::No
+            }
+            .into();
         } else {
             let is_set = self
                 .options
@@ -2201,6 +2209,9 @@ impl LoginConfigHandler {
         if view_only || self.get_toggle_option("show-remote-cursor") {
             msg.show_remote_cursor = BoolOption::Yes.into();
         }
+        if view_only && self.get_toggle_option("show-my-cursor") {
+            msg.show_my_cursor = BoolOption::Yes.into();
+        }
         if self.get_toggle_option("follow-remote-cursor") {
             msg.follow_remote_cursor = BoolOption::Yes.into();
         }
@@ -2263,7 +2274,7 @@ impl LoginConfigHandler {
     ///
     // It's Ok to check the option empty in this function.
     // `get_toggle_option()` is only called in a session.
-    // Custom client advanced settings will not affact this function.
+    // Custom client advanced settings will not effect this function.
     pub fn get_toggle_option(&self, name: &str) -> bool {
         if name == "show-remote-cursor" {
             self.config.show_remote_cursor.v
@@ -2285,6 +2296,8 @@ impl LoginConfigHandler {
             self.config.allow_swap_key.v
         } else if name == "view-only" {
             self.config.view_only.v
+        } else if name == "show-my-cursor" {
+            self.config.show_my_cursor.v
         } else if name == "follow-remote-cursor" {
             self.config.follow_remote_cursor.v
         } else if name == "follow-remote-window" {
@@ -3788,7 +3801,11 @@ pub fn check_if_retry(msgtype: &str, title: &str, text: &str, retry_for_relay: b
         && ((text.contains("10054") || text.contains("104")) && retry_for_relay
             || (!text.to_lowercase().contains("offline")
                 && !text.to_lowercase().contains("not exist")
-                && !text.to_lowercase().contains("handshake")
+                && (!text.to_lowercase().contains("handshake")
+                    // https://github.com/snapview/tungstenite-rs/blob/e7e060a89a72cb08e31c25a6c7284dc1bd982e23/src/error.rs#L248
+                    || text
+                        .to_lowercase()
+                        .contains("connection reset without closing handshake") && use_ws())
                 && !text.to_lowercase().contains("failed")
                 && !text.to_lowercase().contains("resolve")
                 && !text.to_lowercase().contains("mismatch")
@@ -3868,14 +3885,65 @@ async fn hc_connection_(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct FormatId {
+    pub id: String,
+    pub server: Option<(String, String, String)>,
+    pub force_relay: bool,
+}
+
+fn format_id(id: &str) -> FormatId {
+    if id.contains("@") {
+        let mut force_relay = false;
+        let mut v = id.split("@");
+        let raw_id: &str = v.next().unwrap_or_default();
+        let mut server_key = v.next().unwrap_or_default().split('?');
+        let server = server_key.next().unwrap_or_default();
+        let args = server_key.next().unwrap_or_default();
+        let key = if server == PUBLIC_SERVER {
+            config::RS_PUB_KEY.to_owned()
+        } else {
+            let mut args_map: HashMap<String, &str> = HashMap::new();
+            for arg in args.split('&') {
+                if let Some(kv) = arg.find('=') {
+                    let k = arg[0..kv].to_lowercase();
+                    let v = &arg[kv + 1..];
+                    args_map.insert(k, v);
+                }
+            }
+            let key = args_map.remove("key").unwrap_or_default();
+            key.to_owned()
+        };
+
+        // here we can check <id>/r@server
+        let real_id = crate::ui_interface::handle_relay_id(raw_id).to_string();
+        if real_id != raw_id {
+            force_relay = true;
+        }
+        FormatId {
+            id: format!("{real_id}@{server}"),
+            server: Some((real_id.to_string(), server.to_string(), key.to_string())),
+            force_relay,
+        }
+    } else {
+        let real_id = crate::ui_interface::handle_relay_id(&id);
+        FormatId {
+            id: real_id.to_string(),
+            server: None,
+            force_relay: real_id != id,
+        }
+    }
+}
 pub mod peer_online {
+    use std::collections::HashMap;
+
     use hbb_common::{
         anyhow::bail,
         config::{Config, CONNECT_TIMEOUT, READ_TIMEOUT},
         log,
         rendezvous_proto::*,
         sleep,
-        socket_client::connect_tcp,
+       	socket_client::{check_port, connect_tcp},
         ResultType, Stream,
     };
 
@@ -3888,35 +3956,93 @@ pub mod peer_online {
             f(onlines, offlines)
         } else {
             let query_timeout = std::time::Duration::from_millis(3_000);
-            match query_online_states_(&ids, query_timeout).await {
-                Ok((onlines, offlines)) => {
-                    f(onlines, offlines);
+            let (rendezvous_server, _servers, _contained) =
+                 crate::get_rendezvous_server(READ_TIMEOUT).await;
+
+            let group = ids
+                .iter()
+                .map(|id| (id, super::format_id(id)))
+                .map(|(raw_id, format)| {
+                    if let Some((pure_id, server, _key)) = format.server {
+                        (raw_id, pure_id, server)
+                    } else {
+                        (raw_id, format.id, rendezvous_server.clone())
+                    }
+                })
+                .map(|(raw_id, id, server)| {
+                    if server == crate::client::PUBLIC_SERVER {
+                        (
+                            raw_id,
+                            id,
+                            hbb_common::config::RENDEZVOUS_SERVERS[0].to_string(),
+                        )
+                    } else {
+                        (
+                            raw_id,
+                            id,
+                            check_port(server, hbb_common::config::RENDEZVOUS_PORT),
+                        )
+                    }
+                })
+                .fold(HashMap::new(), |mut map, (raw_id, id, server)| {
+                    map.entry(server)
+                        .or_insert(HashMap::new())
+                        .insert(id, raw_id);
+                    map
+                });
+
+            let query_group = group.iter().map(|(server, map)| {
+                let ids: Vec<String> = map.keys().map(|t| t.to_string()).collect();
+                (map, query_online_states_(ids, query_timeout, server))
+            });
+
+            let mut onlines = Vec::new();
+            let mut offlines = Vec::new();
+
+            for (map, query) in query_group.into_iter() {
+                match query.await {
+                    Ok((on, off)) => {
+                        for id in on.iter() {
+                            if let Some(raw_id) = map.get(id) {
+                                onlines.push(raw_id.to_string());
+                            }
+                        }
+                        for id in off.iter() {
+                            if let Some(raw_id) = map.get(id) {
+                                offlines.push(raw_id.to_string());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("query onlines, {}", &e);
+ 		    }
                 }
-                Err(e) => {
-                    log::debug!("query onlines, {}", &e);
-                }
+            }
+            f(onlines, offlines);
+        }
+    }
+
+   async fn create_online_stream(rendezvous_server: &str) -> ResultType<Stream> {
+        let tmp = rendezvous_server.rfind(':').map(|pos| {
+            let url = &rendezvous_server[..pos];
+            let port: u16 = rendezvous_server[pos + 1..].parse().unwrap_or(0);
+            (url, port)
+        });
+        match tmp {
+            Some((url, port)) if port > 0 => {
+                let online_server = format!("{}:{}", url, port - 1);
+                connect_tcp(online_server, CONNECT_TIMEOUT).await
+            }
+            _ => {
+                bail!("Invalid server address: {}", rendezvous_server);
             }
         }
     }
 
-    async fn create_online_stream() -> ResultType<Stream> {
-        let (rendezvous_server, _servers, _contained) =
-            crate::get_rendezvous_server(READ_TIMEOUT).await;
-        let tmp: Vec<&str> = rendezvous_server.split(":").collect();
-        if tmp.len() != 2 {
-            bail!("Invalid server address: {}", rendezvous_server);
-        }
-        let port: u16 = tmp[1].parse()?;
-        if port == 0 {
-            bail!("Invalid server address: {}", rendezvous_server);
-        }
-        let online_server = format!("{}:{}", tmp[0], port - 1);
-        connect_tcp(online_server, CONNECT_TIMEOUT).await
-    }
-
     async fn query_online_states_(
-        ids: &Vec<String>,
+        ids: Vec<String>,
         timeout: std::time::Duration,
+        rendezvous_server: &str,
     ) -> ResultType<(Vec<String>, Vec<String>)> {
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_request(OnlineRequest {
@@ -3925,7 +4051,7 @@ pub mod peer_online {
             ..Default::default()
         });
 
-        let mut socket = match create_online_stream().await {
+    	    let mut socket = match create_online_stream(rendezvous_server).await {
             Ok(s) => s,
             Err(e) => {
                 log::debug!("Failed to create peers online stream, {e}");
