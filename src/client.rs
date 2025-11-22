@@ -1329,7 +1329,7 @@ impl AudioHandler {
 
         self.simple = Some(Simple::new(
             None,                   // Use the default server
-            &crate::get_app_name(), // Our applicationâ€™s name
+            &crate::get_app_name(), // Our application’s name
             Direction::Playback,    // We want a playback stream
             None,                   // Use the default device
             "playback",             // Description of our stream
@@ -1782,13 +1782,13 @@ impl LoginConfigHandler {
         shared_password: Option<String>,
         conn_token: Option<String>,
     ) {
-	let format_id = format_id(id.as_str());
+        let format_id = format_id(id.as_str());
         let id = format_id.id;
         if format_id.force_relay {
-            force_relay = true;
+           force_relay = true;
         };
         if format_id.server.is_some() {
-            self.other_server = format_id.server;
+           self.other_server = format_id.server;
         }
 
         self.id = id;
@@ -1948,10 +1948,21 @@ impl LoginConfigHandler {
     ///
     /// # Arguments
     ///
-    /// * `value` - The view style to be saved.
+    /// * `value` - The scroll style to be saved.
     pub fn save_scroll_style(&mut self, value: String) {
         let mut config = self.load_config();
         config.scroll_style = value;
+        self.save_config(config);
+    }
+
+    /// Save edge scroll edge thickness to the current config.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The edge thickness to be saved.
+    pub fn save_edge_scroll_edge_thickness(&mut self, value: i32) {
+        let mut config = self.load_config();
+        config.edge_scroll_edge_thickness = value;
         self.save_config(config);
     }
 
@@ -3885,6 +3896,7 @@ async fn hc_connection_(
     Ok(())
 }
 
+
 #[derive(Debug, Clone)]
 pub struct FormatId {
     pub id: String,
@@ -3934,6 +3946,7 @@ fn format_id(id: &str) -> FormatId {
         }
     }
 }
+
 pub mod peer_online {
     use std::collections::HashMap;
 
@@ -3943,7 +3956,7 @@ pub mod peer_online {
         log,
         rendezvous_proto::*,
         sleep,
-       	socket_client::{check_port, connect_tcp},
+        socket_client::{check_port, connect_tcp},
         ResultType, Stream,
     };
 
@@ -3957,7 +3970,7 @@ pub mod peer_online {
         } else {
             let query_timeout = std::time::Duration::from_millis(3_000);
             let (rendezvous_server, _servers, _contained) =
-                 crate::get_rendezvous_server(READ_TIMEOUT).await;
+                crate::get_rendezvous_server(READ_TIMEOUT).await;
 
             let group = ids
                 .iter()
@@ -4015,14 +4028,14 @@ pub mod peer_online {
                     }
                     Err(e) => {
                         log::debug!("query onlines, {}", &e);
- 		    }
+                    }
                 }
             }
             f(onlines, offlines);
         }
     }
 
-   async fn create_online_stream(rendezvous_server: &str) -> ResultType<Stream> {
+    async fn create_online_stream(rendezvous_server: &str) -> ResultType<Stream> {
         let tmp = rendezvous_server.rfind(':').map(|pos| {
             let url = &rendezvous_server[..pos];
             let port: u16 = rendezvous_server[pos + 1..].parse().unwrap_or(0);
@@ -4037,6 +4050,7 @@ pub mod peer_online {
                 bail!("Invalid server address: {}", rendezvous_server);
             }
         }
+
     }
 
     async fn query_online_states_(
@@ -4051,7 +4065,7 @@ pub mod peer_online {
             ..Default::default()
         });
 
-    	    let mut socket = match create_online_stream(rendezvous_server).await {
+        let mut socket = match create_online_stream(rendezvous_server).await {
             Ok(s) => s,
             Err(e) => {
                 log::debug!("Failed to create peers online stream, {e}");
