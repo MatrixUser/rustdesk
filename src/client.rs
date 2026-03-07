@@ -3985,8 +3985,8 @@ pub mod peer_online {
             let offlines = onlines.drain((onlines.len() / 2)..).collect();
             f(onlines, offlines)
         } else {
-           let query_timeout = std::time::Duration::from_millis(3_000);
-           let (rendezvous_server, _servers, _contained) =
+            let query_timeout = std::time::Duration::from_millis(3_000);
+            let (rendezvous_server, _servers, _contained) =
                 crate::get_rendezvous_server(READ_TIMEOUT).await;
 
             let group = ids
@@ -4067,11 +4067,6 @@ pub mod peer_online {
                 bail!("Invalid server address: {}", rendezvous_server);
             }
         }
-        let port: u16 = tmp[1].parse()?;
-        if port == 0 {
-            bail!("Invalid server address: {}", rendezvous_server);
-        }
-
     }
 
     async fn query_online_states_(
@@ -4087,7 +4082,6 @@ pub mod peer_online {
         });
 
         let mut socket = match create_online_stream(rendezvous_server).await {
-
             Ok(s) => s,
             Err(e) => {
                 log::debug!("Failed to create peers online stream, {e}");
