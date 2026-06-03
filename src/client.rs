@@ -1746,6 +1746,9 @@ pub struct LoginConfigHandler {
     pub direct: Option<bool>,
     pub received: bool,
     switch_uuid: Option<String>,
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    switch_back_allowed: bool,
     pub save_ab_password_to_recent: bool, // true: connected with ab password
     pub other_server: Option<(String, String, String)>,
     pub custom_fps: Arc<Mutex<Option<usize>>>,
@@ -1786,13 +1789,7 @@ impl LoginConfigHandler {
         shared_password: Option<String>,
         conn_token: Option<String>,
     ) {
-        let format_id = format_id(id.as_str());
-        let id = format_id.id;
-        if format_id.force_relay {
-            force_relay = true;
-        }
-        if format_id.server.is_some() {
-            self.other_server = format_id.server;
+
         }
 
         self.id = id;
@@ -1834,6 +1831,11 @@ impl LoginConfigHandler {
 
         self.direct = None;
         self.received = false;
+        #[cfg(feature = "flutter")]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            self.switch_back_allowed = false;
+        }
         self.switch_uuid = switch_uuid;
         self.adapter_luid = adapter_luid;
         self.selected_windows_session_id = None;
@@ -1845,6 +1847,23 @@ impl LoginConfigHandler {
         let is_terminal_admin = conn_type == ConnType::TERMINAL
             && std::env::var("IS_TERMINAL_ADMIN").map_or(false, |v| v == "Y");
         self.is_terminal_admin = is_terminal_admin;
+    }
+
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn allow_switch_back_once(&mut self) {
+        self.switch_back_allowed = true;
+    }
+
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn consume_switch_back_permission(&mut self) -> bool {
+        if self.switch_back_allowed {
+            self.switch_back_allowed = false;
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if the client should auto login.
@@ -3350,6 +3369,36 @@ pub fn handle_login_error(
     }
 }
 
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
+    let Ok(mut conn) = crate::ipc::connect(1000, "").await else {
+        return false;
+    };
+    let uuid = uuid.to_string();
+    if conn
+        .send(&crate::ipc::Data::SwitchSidesUuid(
+            uuid.clone(),
+            id.to_owned(),
+            None,
+        ))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    match conn.next_timeout(1000).await {
+        Ok(Some(crate::ipc::Data::SwitchSidesUuid(
+            returned_uuid,
+            returned_id,
+            Some(true),
+        ))) => {
+            returned_uuid == uuid && returned_id == id
+        }
+        _ => false,
+    }
+}
+
 /// Handle hash message sent by peer.
 /// Hash will be used for login.
 ///
@@ -3370,12 +3419,22 @@ pub async fn handle_hash(
     // Take care of password application order
 
     // switch_uuid
-    let uuid = lc.write().unwrap().switch_uuid.take();
-    if let Some(uuid) = uuid {
-        if let Ok(uuid) = uuid::Uuid::from_str(&uuid) {
-            send_switch_login_request(lc.clone(), peer, uuid).await;
-            lc.write().unwrap().password_source = Default::default();
-            return;
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let uuid = lc.write().unwrap().switch_uuid.take();
+        if let Some(uuid) = uuid {
+            if let Ok(uuid) = uuid::Uuid::from_str(&uuid) {
+                let id = lc.read().unwrap().id.clone();
+                if !consume_local_switch_sides_uuid(&id, &uuid).await {
+                    log::warn!("Ignored untrusted switch_uuid");
+                } else {
+                    lc.write().unwrap().allow_switch_back_once();
+                    send_switch_login_request(lc.clone(), peer, uuid).await;
+                    lc.write().unwrap().password_source = Default::default();
+                    return;
+                }
+            }
         }
     }
     // last password
@@ -3843,6 +3902,7 @@ pub fn check_if_retry(msgtype: &str, title: &str, text: &str, retry_for_relay: b
                 && !text.to_lowercase().contains("resolve")
                 && !text.to_lowercase().contains("mismatch")
                 && !text.to_lowercase().contains("manually")
+                && !text.to_lowercase().contains("restricted")
                 && !text.to_lowercase().contains("not allowed")))
 }
 
@@ -3991,7 +4051,7 @@ pub mod peer_online {
             f(onlines, offlines)
         } else {
             let query_timeout = std::time::Duration::from_millis(3_000);
-            let (rendezvous_server, _servers, _contained) =
+           let (rendezvous_server, _servers, _contained) =
                 crate::get_rendezvous_server(READ_TIMEOUT).await;
 
             let group = group_query_online_states(ids, rendezvous_server.as_str());
@@ -4034,10 +4094,9 @@ pub mod peer_online {
                     }
                     Err(e) => {
                         log::error!("task panicked: {}", e);
-                    }
-                }
+                    } 
+               }
             }
-
             f(onlines, offlines);
         }
     }
@@ -4061,8 +4120,8 @@ pub mod peer_online {
 
     async fn query_online_states_(
         ids: Vec<String>,
-        timeout: std::time::Duration,
         rendezvous_server: &str,
+        timeout: std::time::Duration,
     ) -> ResultType<(Vec<String>, Vec<String>)> {
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_request(OnlineRequest {
@@ -4071,7 +4130,8 @@ pub mod peer_online {
             ..Default::default()
         });
 
-        let mut socket = match create_online_stream(rendezvous_server).await {
+        let mut socket = match create_online_stream(rendezvous_server).await
+{
             Ok(s) => s,
             Err(e) => {
                 log::debug!("Failed to create peers online stream, {e}");
@@ -4184,7 +4244,6 @@ pub mod peer_online {
             )
             .await;
         }
-
         #[test]
         fn test_group_query_online_states() {
             use std::collections::HashMap;
