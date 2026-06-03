@@ -1789,7 +1789,13 @@ impl LoginConfigHandler {
         shared_password: Option<String>,
         conn_token: Option<String>,
     ) {
-
+        let format_id = format_id(id.as_str());
+        let id = format_id.id;
+        if format_id.force_relay {
+            force_relay = true;
+        }
+        if format_id.server.is_some() {
+            self.other_server = format_id.server;
         }
 
         self.id = id;
@@ -4051,7 +4057,7 @@ pub mod peer_online {
             f(onlines, offlines)
         } else {
             let query_timeout = std::time::Duration::from_millis(3_000);
-           let (rendezvous_server, _servers, _contained) =
+            let (rendezvous_server, _servers, _contained) =
                 crate::get_rendezvous_server(READ_TIMEOUT).await;
 
             let group = group_query_online_states(ids, rendezvous_server.as_str());
@@ -4094,9 +4100,10 @@ pub mod peer_online {
                     }
                     Err(e) => {
                         log::error!("task panicked: {}", e);
-                    } 
-               }
+                    }
+                }
             }
+
             f(onlines, offlines);
         }
     }
@@ -4120,8 +4127,8 @@ pub mod peer_online {
 
     async fn query_online_states_(
         ids: Vec<String>,
-        rendezvous_server: &str,
         timeout: std::time::Duration,
+        rendezvous_server: &str,
     ) -> ResultType<(Vec<String>, Vec<String>)> {
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_request(OnlineRequest {
@@ -4130,8 +4137,7 @@ pub mod peer_online {
             ..Default::default()
         });
 
-        let mut socket = match create_online_stream(rendezvous_server).await
-{
+        let mut socket = match create_online_stream(rendezvous_server).await {
             Ok(s) => s,
             Err(e) => {
                 log::debug!("Failed to create peers online stream, {e}");
@@ -4244,6 +4250,7 @@ pub mod peer_online {
             )
             .await;
         }
+
         #[test]
         fn test_group_query_online_states() {
             use std::collections::HashMap;
