@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: Quellcode auschecken
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Rust Toolchain installieren
         uses: dtolnay/rust-toolchain@stable
