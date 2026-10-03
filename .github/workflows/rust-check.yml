@@ -1,7 +1,6 @@
 name: Schnelltest Rust-Code
 
 on:
-    branches: [ rustdesk1.5.0 ] # Passe dies an deinen Branch-Namen an
   workflow_dispatch: # Erlaubt das manuelle Starten per Button auf GitHub
 
 jobs:
