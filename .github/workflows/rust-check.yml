@@ -1,5 +1,9 @@
 name: Schnelltest Rust-Code
 
+env:
+  VCPKG_ROOT: C:\vcpkg
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
 on:
   workflow_dispatch: # Erlaubt das manuelle Starten per Button auf GitHub
 
