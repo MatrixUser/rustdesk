@@ -27,4 +27,4 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Cargo Check ausführen
-        run: cargo check --manifest-path Cargo.toml
+        run: cargo check --lib --bin rustdesk
